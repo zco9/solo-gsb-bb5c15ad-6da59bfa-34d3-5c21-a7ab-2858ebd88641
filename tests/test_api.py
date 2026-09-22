@@ -1,7 +1,13 @@
 """API 端到端测试：使用临时 SQLite 库，通过 TestClient 走完整请求链路。"""
 from __future__ import annotations
 
+import socket
+import threading
+import time
+
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -159,6 +165,226 @@ def test_analysis_404s(client):
     assert client.get("/analyses/999").status_code == 404
     client.post("/sites", json=make_payload())
     assert client.get("/sites/1/analysis").status_code == 404  # 尚未分析
+
+
+# ---------------------------------------------------------------- 幂等键（Idempotency-Key）
+
+def test_analysis_without_idempotency_key_keeps_existing_behavior(client):
+    # 未提供请求头：每次 POST 都执行并保存一份新分析（201）
+    client.post("/sites", json=make_payload())
+    first = client.post("/sites/1/analysis")
+    second = client.post("/sites/1/analysis")
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["analysis_id"] > first.json()["analysis_id"]
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == [
+        first.json()["analysis_id"],
+        second.json()["analysis_id"],
+    ]
+
+
+def test_idempotency_key_replays_first_result_without_new_record(client):
+    client.post("/sites", json=make_payload())
+    headers = {"Idempotency-Key": "run-001"}
+    first = client.post("/sites/1/analysis", headers=headers)
+    assert first.status_code == 201, first.text
+
+    replay = client.post("/sites/1/analysis", headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()  # 完全返回首次结果（含 analysis_id/created_at）
+
+    # 再次重放仍为同一份结果，且只新增过一条分析记录
+    replay2 = client.post("/sites/1/analysis", headers=headers)
+    assert replay2.status_code == 200
+    assert replay2.json() == first.json()
+    assert client.get("/sites/1/analyses").json() == [
+        {
+            "analysis_id": first.json()["analysis_id"],
+            "site_id": 1,
+            "created_at": first.json()["created_at"],
+            "product_count": first.json()["product_count"],
+        }
+    ]
+    # 最近分析与按 id 查询都指向首次结果；现有查询接口保持兼容
+    assert client.get("/sites/1/analysis").json() == first.json()
+    assert client.get(f"/analyses/{first.json()['analysis_id']}").json() == first.json()
+    # 重放也可经风险分组等下游接口读到同一份持久化结果
+    assert client.get(
+        f"/analyses/{first.json()['analysis_id']}/risk-groups"
+    ).status_code == 200
+
+
+def test_idempotency_keys_are_scoped_per_site(client):
+    client.post("/sites", json=make_payload())
+    client.post("/sites", json=make_payload(name="site-b"))
+    # 不同站点使用相同键互不影响，各自首次执行
+    r1 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "shared-key"})
+    r2 = client.post("/sites/2/analysis", headers={"Idempotency-Key": "shared-key"})
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    assert r1.json()["site_id"] == 1 and r2.json()["site_id"] == 2
+    assert r1.json()["analysis_id"] != r2.json()["analysis_id"]
+    # 各自重放仍命中本站点的首次结果
+    assert client.post(
+        "/sites/1/analysis", headers={"Idempotency-Key": "shared-key"}
+    ).json()["analysis_id"] == r1.json()["analysis_id"]
+    assert client.post(
+        "/sites/2/analysis", headers={"Idempotency-Key": "shared-key"}
+    ).json()["analysis_id"] == r2.json()["analysis_id"]
+
+
+def test_different_idempotency_keys_produce_separate_analyses(client):
+    client.post("/sites", json=make_payload())
+    r1 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-one"})
+    r2 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-two"})
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r2.json()["analysis_id"] > r1.json()["analysis_id"]
+    assert len(client.get("/sites/1/analyses").json()) == 2
+    # 不带键的请求不影响已登记键，反之亦然
+    r3 = client.post("/sites/1/analysis")
+    assert r3.status_code == 201
+    replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-one"})
+    assert replay.status_code == 200
+    assert replay.json()["analysis_id"] == r1.json()["analysis_id"]
+
+
+def test_blank_idempotency_key_rejected_as_422(client):
+    client.post("/sites", json=make_payload())
+    for blank in ("", " ", "   ", "\t", " \t "):
+        resp = client.post("/sites/1/analysis", headers={"Idempotency-Key": blank})
+        assert resp.status_code == 422, repr(blank)
+        assert "Idempotency-Key" in resp.json()["detail"]
+    # 空白键被拒绝时不登记、不产生任何分析记录
+    assert client.get("/sites/1/analyses").json() == []
+    # 非空白键含空白字符仍视为合法（不做 strip）
+    ok = client.post("/sites/1/analysis", headers={"Idempotency-Key": " key "})
+    assert ok.status_code == 201
+
+
+def test_idempotency_key_on_missing_site_still_404(client):
+    assert client.post(
+        "/sites/999/analysis", headers={"Idempotency-Key": "k"}
+    ).status_code == 404
+
+
+def test_failed_first_request_rolls_back_registration(client, monkeypatch):
+    # 首次请求在事务内计算失败时登记行与分析都回滚；随后同键请求应能作为
+    # 新的首次请求重新执行成功，而不是永久卡死或重放到不存在的结果
+    client.post("/sites", json=make_payload())
+    from app import main as main_module
+    from app import analysis as analysis_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom during analysis")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(main_module, "analyze", boom)
+        with pytest.raises(Exception, match="boom"):
+            client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+    # 离开 context 后路由模块引用已恢复（IMD_DB_PATH 等其他补丁不受影响）
+    assert main_module.analyze is analysis_module.analyze
+
+    retry = client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+    assert retry.status_code == 201, retry.text
+    replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+    assert replay.status_code == 200
+    assert replay.json() == retry.json()
+    assert len(client.get("/sites/1/analyses").json()) == 1
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_concurrent_requests_with_same_idempotency_key_produce_one_result(
+    tmp_path, monkeypatch
+):
+    # 真实 HTTP 并发重放：in-process uvicorn + 多线程。分析计算被刻意放慢，
+    # 保证多个请求在首个事务内重叠到达；BEGIN IMMEDIATE + UNIQUE(site_id,key)
+    # 必须使它们只产生一份分析结果。
+    db_path = tmp_path / "conc.db"
+    monkeypatch.setenv("IMD_DB_PATH", str(db_path))
+
+    port = _free_tcp_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+    try:
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30) as http:
+            r = http.post(
+                "/sites",
+                json=make_payload(),
+            )
+            assert r.status_code == 201, r.text
+
+            from app import analysis as analysis_module
+            from app import main as main_module
+
+            real_analyze = main_module.analyze
+
+            def slow_analyze(*args, **kwargs):
+                time.sleep(0.5)  # 放大窗口，确保并发请求在同一时刻重叠
+                return real_analyze(*args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(main_module, "analyze", slow_analyze)
+                n = 8
+                barrier = threading.Barrier(n)
+                responses: list[httpx.Response | None] = [None] * n
+
+                def worker(i: int) -> None:
+                    barrier.wait()
+                    responses[i] = http.post(
+                        "/sites/1/analysis",
+                        headers={"Idempotency-Key": "concurrent-key"},
+                    )
+
+                threads = [
+                    threading.Thread(target=worker, args=(i,)) for i in range(n)
+                ]
+                start = time.monotonic()
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join()
+                elapsed = time.monotonic() - start
+
+            statuses = sorted(resp.status_code for resp in responses if resp is not None)
+            assert statuses == [200] * (n - 1) + [201], statuses
+            bodies = [resp.json() for resp in responses if resp is not None]
+            assert all(body == bodies[0] for body in bodies)
+            # 全部并发请求合计只产生一份分析记录
+            metas = http.get("/sites/1/analyses").json()
+            assert len(metas) == 1
+            assert metas[0]["analysis_id"] == bodies[0]["analysis_id"]
+            # 串行化生效：总耗时远小于 n 次完整分析（0.5s）串行之和
+            assert elapsed < n * 0.5
+
+            # 并发结束后再用同键请求，仍是稳定的 200 重放
+            after = http.post(
+                "/sites/1/analysis", headers={"Idempotency-Key": "concurrent-key"}
+            )
+            assert after.status_code == 200
+            assert after.json() == bodies[0]
+
+            # 分析模块恢复后，不带键的请求仍产生新分析
+            extra = http.post("/sites/1/analysis")
+            assert extra.status_code == 201
+            assert len(http.get("/sites/1/analyses").json()) == 2
+            assert analysis_module.analyze is main_module.analyze
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------- 风险分组

@@ -19,8 +19,9 @@ docker compose up --build
 - **OpenAPI JSON**：`http://localhost:8000/openapi.json`
 - **端口**：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 中修改）
 
-数据库文件在容器启动时自动初始化（幂等建表），无需手动迁移；
+数据库文件在容器启动时自动初始化（幂等建表，含 `idempotency_keys` 幂等登记表），无需手动迁移；
 数据持久化在命名卷 `imd-data`（容器内路径 `/data/intermod.db`）中。
+旧版本已存在的数据库在下次启动时会自动补建幂等表（`CREATE TABLE IF NOT EXISTS`），不影响既有数据。
 
 停止并清理：`docker compose down`（加 `-v` 同时删除数据卷）。
 
@@ -255,6 +256,46 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 }
 ```
 
+## 幂等分析（Idempotency-Key）
+
+`POST /sites/{site_id}/analysis` 支持**可选**请求头 `Idempotency-Key`，用于在重试/并发场景下
+保证同一站点的同键请求只产生一份分析结果：
+
+- **首次请求**：携带此前未出现过的 `(site_id, key)` 时，正常执行分析、保存结果并返回 `201`；
+  服务在**同一个 SQLite 事务**（`BEGIN IMMEDIATE` 立即取得写锁）内完成登记查重、分析计算、
+  分析记录与登记行的写入，分析记录与登记行要么同时可见、要么同时回滚。
+- **重复请求**：同一站点再次携带相同键时，**不重新执行分析、不新增分析记录**，直接返回首次
+  请求保存的完整结果（`analysis_id`、`created_at`、`products` 完全一致），状态码为 `200`。
+- **并发请求**：多个请求并发携带同一键到达时，写锁在事务入口将它们串行化——只有一个请求能
+  插入登记行（表上有 `PRIMARY KEY (site_id, key)` 唯一约束），其余请求等待首个事务提交后
+  重放首次结果，因此**无论并发多高，同一键至多产生一份分析记录**。
+- **按站点隔离**：键的作用域是单个站点，不同站点使用相同键互不影响。
+- **失败回滚**：首次请求在计算或写入阶段失败时，整个事务（含登记行）回滚，后续同键请求可
+  作为新的首次请求重新执行，不会被卡死在半登记状态。
+- **空白键**：请求头为空字符串或仅含空白字符时返回 `422`（不登记、不写分析）。
+- **不携带该头**：行为与既有版本完全一致——每次请求都执行并保存一次新分析（`201`），
+  现有调用方无需任何改动。
+
+幂等登记只影响 `POST` 是否新增分析；所有现有查询接口（`GET /sites/{site_id}/analysis`、
+`GET /sites/{site_id}/analyses`、`GET /analyses/{id}` 及其下游风险分组/停用方案/跨站点检测）
+响应结构与语义保持不变，首次分析产生的记录与普通分析记录可同样查询。
+
+```bash
+# 首次请求：201，执行并保存
+curl -i -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: 2026-09-22-run-001'
+
+# 重试/重复请求：200，返回同一份结果（相同 analysis_id），不新增记录
+curl -i -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: 2026-09-22-run-001'
+
+# 不带该头：行为不变，仍每次产生新分析（201）
+curl -X POST http://localhost:8000/sites/1/analysis
+```
+
+建议客户端为每个"逻辑上的一次分析"生成一个稳定的键（如 UUID 或业务流水号），仅在重试
+同一逻辑请求时复用；需要再做一次独立分析时使用新键或省略该头。
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -274,7 +315,7 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
 | `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
-| `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
+| `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 请求头：同站点重复/并发同键返回首次结果（`200`）且不新增记录，空白键 `422` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
@@ -299,6 +340,12 @@ curl -X POST http://localhost:8000/sites \
 
 # 执行分析（载频 100/300/400 时，2*300-100 与 2*400-300 同为 500 Hz，会聚合为一条）
 curl -X POST http://localhost:8000/sites/1/analysis
+
+# 需要重试安全/并发去重时，携带 Idempotency-Key：同键重复请求返回首次结果（200），不新增记录
+curl -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: run-001'
+curl -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: run-001'  # 200，响应与第一次完全一致
 
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
@@ -392,7 +439,8 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（57 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、载频漂移风险评估、跨站点冲突检测）
+# 运行测试（65 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，以及幂等键的重复重放、失败回滚与并发去重）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -411,7 +459,7 @@ uvicorn app.main:app --reload
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
   analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、跨站点最近分析批量查询）
+  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

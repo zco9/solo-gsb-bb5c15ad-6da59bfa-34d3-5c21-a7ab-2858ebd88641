@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 
 from . import database
 from .analysis import (
@@ -24,6 +24,7 @@ from .schemas import (
     DriftRiskRequest,
     DriftRiskResult,
     MitigationPlan,
+    ProductOut,
     RiskGroup,
     SiteAnalysisRef,
     SiteCreate,
@@ -183,26 +184,57 @@ def evaluate_drift_risk(site_id: int, payload: DriftRiskRequest) -> DriftRiskRes
     status_code=status.HTTP_201_CREATED,
     tags=["analysis"],
     summary="对方案执行三阶互调分析并保存结果",
+    description=(
+        "执行分析并保存结果，返回 201。\n\n"
+        "可选请求头 **Idempotency-Key**：提供后按 (站点, 键) 原子登记请求——"
+        "首次请求执行分析并保存；同一站点重复使用该键时不再次执行分析、"
+        "不新增分析记录，直接返回首次结果（200）；并发的同键请求也只会产生"
+        "一份分析结果。不同站点使用相同键互不影响。键为空白（空字符串或仅含"
+        "空白字符）返回 422。未提供该头时行为不变：每次请求都执行并保存一次"
+        "新的分析（201）。站点不存在返回 404。"
+    ),
+    responses={
+        200: {"model": AnalysisResult, "description": "命中 Idempotency-Key，返回首次分析结果"},
+        201: {"model": AnalysisResult, "description": "首次执行并保存分析结果"},
+    },
 )
-def run_analysis(site_id: int) -> AnalysisResult:
+def run_analysis(
+    site_id: int,
+    response: Response,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description=(
+            "可选幂等键：同一站点重复使用相同键直接返回首次结果（200），"
+            "不新增分析记录；空白键返回 422"
+        ),
+    ),
+) -> AnalysisResult:
+    if idempotency_key is not None and not idempotency_key.strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Idempotency-Key header must not be blank",
+        )
     site = database.fetch_site(site_id)
     if site is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
-    products = analyze(
-        carriers_hz=site.carriers_hz,
-        scan_start_hz=site.scan_start_hz,
-        scan_end_hz=site.scan_end_hz,
-        guard_bands=site.guard_bands,
-        guard_interval_hz=site.guard_interval_hz,
+
+    def compute_products() -> list[ProductOut]:
+        return analyze(
+            carriers_hz=site.carriers_hz,
+            scan_start_hz=site.scan_start_hz,
+            scan_end_hz=site.scan_end_hz,
+            guard_bands=site.guard_bands,
+            guard_interval_hz=site.guard_interval_hz,
+        )
+
+    result, created = database.save_analysis_once(
+        site_id, idempotency_key, compute_products
     )
-    analysis_id, created_at = database.insert_analysis(site_id, products)
-    return AnalysisResult(
-        analysis_id=analysis_id,
-        site_id=site_id,
-        created_at=created_at,
-        product_count=len(products),
-        products=products,
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
+    return result
 
 
 @app.get(

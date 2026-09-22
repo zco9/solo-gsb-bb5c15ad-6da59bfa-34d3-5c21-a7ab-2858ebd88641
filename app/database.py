@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -51,6 +52,17 @@ CREATE TABLE IF NOT EXISTS analyses (
     product_count INTEGER NOT NULL,
     result_json   TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    site_id     INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    key         TEXT    NOT NULL,
+    analysis_id INTEGER NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (site_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_analysis
+    ON idempotency_keys (analysis_id);
 """
 
 
@@ -61,9 +73,10 @@ def db_path() -> str:
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     """短连接上下文：正常结束提交，抛异常回滚。"""
-    con = sqlite3.connect(db_path())
+    con = sqlite3.connect(db_path(), timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA busy_timeout = 30000")
     try:
         yield con
         con.commit()
@@ -156,6 +169,116 @@ def insert_analysis(site_id: int, products: list[ProductOut]) -> tuple[int, str]
             "SELECT created_at FROM analyses WHERE id = ?", (cur.lastrowid,)
         ).fetchone()["created_at"]
     return cur.lastrowid, created_at
+
+
+# 并发使用同一幂等键时，落败方等待领先方事务的最长时间（秒）。
+IDEMPOTENT_BUSY_TIMEOUT_SECONDS = 30.0
+
+
+def save_analysis_once(
+    site_id: int,
+    idempotency_key: str | None,
+    compute_products: Callable[[], list[ProductOut]],
+) -> tuple[AnalysisResult, bool]:
+    """执行并保存分析；带幂等键时按 (站点, 键) 原子登记，重复键直接重放。
+
+    返回 (AnalysisResult, created)：created=True 表示本次实际执行并写入了
+    新分析；False 表示命中既有登记，返回首次结果。
+
+    幂等路径在同一个 SQLite 事务（BEGIN IMMEDIATE，立即取得写锁）内完成
+    登记查重、分析计算、分析结果与登记行写入并提交：并发同键请求中只有一个
+    能成功插入登记行（PRIMARY KEY(site_id, key)），落败方在写锁释放后
+    重放已提交的首次结果，因此至多产生一份分析记录。计算或写入任一步
+    失败都会整体回滚，后续同键请求可作为新的首次请求重新执行。
+
+    idempotency_key 为 None 时保持既有行为：每次调用都产生新分析记录。
+    """
+    if idempotency_key is None:
+        products = compute_products()
+        analysis_id, created_at = insert_analysis(site_id, products)
+        result = _build_result(
+            site_id, analysis_id, created_at, len(products), products
+        )
+        return result, True
+
+    con = sqlite3.connect(db_path(), timeout=IDEMPOTENT_BUSY_TIMEOUT_SECONDS)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute(f"PRAGMA busy_timeout = {int(IDEMPOTENT_BUSY_TIMEOUT_SECONDS * 1000)}")
+    # isolation_level=None：手动控制事务，BEGIN IMMEDIATE 立即获取保留锁，
+    # 使并发同键请求在事务入口串行化（而非各自先读后竞争插入）。
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            "SELECT a.*"
+            " FROM idempotency_keys k JOIN analyses a ON a.id = k.analysis_id"
+            " WHERE k.site_id = ? AND k.key = ?",
+            (site_id, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            con.execute("COMMIT")
+            return _row_to_result(existing), False
+
+        # 首次请求：分析结果与登记行在同一事务内写入。BEGIN IMMEDIATE 已
+        # 取得写锁，并发同键请求会阻塞至本事务提交后重放，故计算期间
+        # 不可能有其他事务插入同键登记；任一（计算/写入）失败整体回滚。
+        products = compute_products()
+        result_json = json.dumps([p.model_dump() for p in products])
+        cur = con.execute(
+            "INSERT INTO analyses (site_id, product_count, result_json) VALUES (?, ?, ?)",
+            (site_id, len(products), result_json),
+        )
+        analysis_id = cur.lastrowid
+        con.execute(
+            "INSERT INTO idempotency_keys (site_id, key, analysis_id) VALUES (?, ?, ?)",
+            (site_id, idempotency_key, analysis_id),
+        )
+        row = con.execute(
+            "SELECT id, site_id, created_at, product_count, result_json"
+            " FROM analyses WHERE id = ?",
+            (analysis_id,),
+        ).fetchone()
+        con.execute("COMMIT")
+        return _row_to_result(row), True
+    except sqlite3.IntegrityError:
+        # 并发事务抢先提交了同键登记：本事务已在 BEGIN IMMEDIATE 处
+        # 被写锁阻塞至领先方提交之后才继续，故唯一冲突只可能来自该路径。
+        con.execute("ROLLBACK")
+        row = con.execute(
+            "SELECT a.*"
+            " FROM idempotency_keys k JOIN analyses a ON a.id = k.analysis_id"
+            " WHERE k.site_id = ? AND k.key = ?",
+            (site_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            raise  # 非并发重放冲突（理论不可达）：交给上层按 500 处理
+        return _row_to_result(row), False
+    except Exception:
+        # 计算或写入失败：回滚登记行与分析，后续同键请求可重新执行。
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # 事务已提交时不再回滚（保留原始异常向上抛出）
+        raise
+    finally:
+        con.close()
+
+
+def _build_result(
+    site_id: int,
+    analysis_id: int,
+    created_at: str,
+    product_count: int,
+    products: list[ProductOut],
+) -> AnalysisResult:
+    return AnalysisResult(
+        analysis_id=analysis_id,
+        site_id=site_id,
+        created_at=created_at,
+        product_count=product_count,
+        products=products,
+    )
 
 
 def _row_to_result(row: sqlite3.Row) -> AnalysisResult:
