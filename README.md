@@ -24,6 +24,23 @@ docker compose up --build
 
 停止并清理：`docker compose down`（加 `-v` 同时删除数据卷）。
 
+后台运行：`docker compose up --build -d`，查看日志用 `docker compose logs -f`。
+
+**已有数据库（旧版本）升级**：服务启动时执行幂等建表，`analysis_idempotency_keys`
+幂等登记表会在旧库上自动补建，已有的站点与分析记录不受影响，无需手动迁移或删卷。
+
+不使用 Compose 时可用 Docker 原生命令启动（容器内 `/data` 挂载到宿主机目录持久化）：
+
+```bash
+docker build -t rf-intermod-api .
+docker run -d --name rf-intermod-api -p 8000:8000 \
+  -v "$(pwd)/data:/data" \
+  -e IMD_DB_PATH=/data/intermod.db \
+  rf-intermod-api
+```
+
+健康检查：`curl http://localhost:8000/health` 返回 `{"status":"ok"}`。
+
 ## 分析语义
 
 - **产物枚举**：对全部有序载频对 `(fa, fb)` 且 `fa ≠ fb` 计算 `2·fa − fb`。
@@ -37,6 +54,41 @@ docker compose up --build
 - **保护间隔**：`violates_guard_interval = (distance_hz < guard_interval_hz)`，
   即产物到命中对象的间距小于保护间隔时判定为违规。
 - **排序**：结果按产物频率升序；同频产物已聚合，频率唯一，排序稳定确定。
+
+## 幂等分析（Idempotency-Key）
+
+`POST /sites/{site_id}/analysis` 支持**可选**请求头 `Idempotency-Key`，用于在网络重试、
+超时重发或并发提交时保证“同一逻辑请求只执行并保存一次分析”：
+
+- **首次请求**：携带非空白键时，服务在**同一个 SQLite 事务**内完成三件事——
+  按 `(站点, 键)` 登记请求、执行分析、保存分析记录，三步要么全部提交要么整体回滚。
+- **重复键回放**：同一站点再次携带相同键时，**不执行分析、不新增分析记录**，
+  直接返回首次结果；响应体与首次响应完全一致（含相同的 `analysis_id` 与 `created_at`），
+  现有查询接口（`GET /sites/{id}/analysis`、`GET /analyses/{id}` 等）行为不变。
+- **并发安全**：事务以 `BEGIN IMMEDIATE` 立即获取写库锁，携带同一键的并发请求在锁上
+  排队；持锁事务提交后，其余请求读到已提交的登记行并回放，因此同一 `(站点, 键)`
+  **无论多少并发请求都只产生一份结果**。
+- **按站点隔离**：键的作用域是单个站点——不同站点使用相同字符串键互不影响。
+- **不带请求头**：不携带 `Idempotency-Key` 时保持原有行为，每次请求都执行并保存一份新分析。
+- **空白键拒绝**：值为空串或仅空白字符（空格、制表符等）时返回 `422`；
+  非空白键但站点不存在返回 `404`。
+
+建议为每个独立的分析操作生成一个唯一键（如 UUID），仅在重试/重发同一逻辑操作时复用该键。
+
+```bash
+# 首次执行（分析并保存）；重试时复用同一个键即可安全重放
+curl -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: 9f1c2e7a-7d3b-4b6a-9c2e-1a2b3c4d5e6f'
+
+# 不带头：每次都产生一条新分析记录（旧行为）
+curl -X POST http://localhost:8000/sites/1/analysis
+
+# 空白键 -> 422
+curl -X POST http://localhost:8000/sites/1/analysis -H 'Idempotency-Key:   '
+```
+
+幂等键登记保存在数据库表 `analysis_idempotency_keys`（复合主键 `(site_id, idempotency_key)`）中；
+旧版本数据库在服务启动时由幂等建表自动补建该表，**无需手动迁移**，已有数据不受影响。
 
 ## 风险分组（risk groups）
 
@@ -274,7 +326,7 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
 | `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
-| `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
+| `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 头实现按站点的请求幂等（重复/并发同键回放首次结果且不新增记录，空白键 → 422，不带头则每次新建） |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
@@ -299,6 +351,10 @@ curl -X POST http://localhost:8000/sites \
 
 # 执行分析（载频 100/300/400 时，2*300-100 与 2*400-300 同为 500 Hz，会聚合为一条）
 curl -X POST http://localhost:8000/sites/1/analysis
+
+# 携带幂等键执行分析：同一键的重试或并发重发只保存一份结果，后续返回首次响应
+curl -X POST http://localhost:8000/sites/1/analysis \
+  -H 'Idempotency-Key: 9f1c2e7a-7d3b-4b6a-9c2e-1a2b3c4d5e6f'
 
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
@@ -392,7 +448,7 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（57 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、载频漂移风险评估、跨站点冲突检测）
+# 运行测试（66 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，以及 Idempotency-Key 幂等登记/回放/失败回滚/空白键拒绝/按站点隔离/并发同键唯一结果/旧库升级）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -411,7 +467,7 @@ uvicorn app.main:app --reload
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
   analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、跨站点最近分析批量查询）
+  database.py   # SQLite 建表与读写（单事务批量写入、同事务幂等键登记与回放、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

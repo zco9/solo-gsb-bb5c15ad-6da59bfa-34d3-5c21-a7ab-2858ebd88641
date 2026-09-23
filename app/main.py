@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, status
 
 from . import database
 from .analysis import (
@@ -183,26 +184,63 @@ def evaluate_drift_risk(site_id: int, payload: DriftRiskRequest) -> DriftRiskRes
     status_code=status.HTTP_201_CREATED,
     tags=["analysis"],
     summary="对方案执行三阶互调分析并保存结果",
+    description=(
+        "执行分析并保存结果，返回 `201`。\n\n"
+        "可选请求头 `Idempotency-Key`：携带非空白键时，服务在单个 SQLite 事务内"
+        "按 (站点, 键) 原子登记请求——首次请求执行并保存分析；重复键（包括同键的"
+        "并发请求）不新增分析记录，直接返回首次结果（响应体与首次完全一致）。"
+        "键按站点隔离，同一字符串用于不同站点互不影响。空白键（仅空白字符）"
+        "返回 `422`；不携带该头时每次请求都执行并保存一次新分析，行为与旧版一致。"
+    ),
 )
-def run_analysis(site_id: int) -> AnalysisResult:
+def run_analysis(
+    site_id: int,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            description=(
+                "可选幂等键：同站点同键的重复/并发请求只执行并保存一次分析，"
+                "后续请求回放首次结果；空白键返回 422"
+            ),
+        ),
+    ] = None,
+) -> AnalysisResult:
     site = database.fetch_site(site_id)
     if site is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
-    products = analyze(
-        carriers_hz=site.carriers_hz,
-        scan_start_hz=site.scan_start_hz,
-        scan_end_hz=site.scan_end_hz,
-        guard_bands=site.guard_bands,
-        guard_interval_hz=site.guard_interval_hz,
+    if idempotency_key is not None and not idempotency_key.strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Idempotency-Key header must not be blank",
+        )
+
+    def compute_products():
+        return analyze(
+            carriers_hz=site.carriers_hz,
+            scan_start_hz=site.scan_start_hz,
+            scan_end_hz=site.scan_end_hz,
+            guard_bands=site.guard_bands,
+            guard_interval_hz=site.guard_interval_hz,
+        )
+
+    if idempotency_key is None:
+        # 不携带幂等头：保持原有行为，每次都执行并保存一份新分析
+        products = compute_products()
+        analysis_id, created_at = database.insert_analysis(site_id, products)
+        return AnalysisResult(
+            analysis_id=analysis_id,
+            site_id=site_id,
+            created_at=created_at,
+            product_count=len(products),
+            products=products,
+        )
+
+    # 携带幂等头：登记、执行、保存处于同一事务，重复/并发同键回放首次结果
+    result, _created = database.insert_analysis_idempotent(
+        site_id, idempotency_key, compute_products
     )
-    analysis_id, created_at = database.insert_analysis(site_id, products)
-    return AnalysisResult(
-        analysis_id=analysis_id,
-        site_id=site_id,
-        created_at=created_at,
-        product_count=len(products),
-        products=products,
-    )
+    return result
 
 
 @app.get(

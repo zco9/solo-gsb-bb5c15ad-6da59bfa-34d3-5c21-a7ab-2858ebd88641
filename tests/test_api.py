@@ -161,6 +161,228 @@ def test_analysis_404s(client):
     assert client.get("/sites/1/analysis").status_code == 404  # 尚未分析
 
 
+# ---------------------------------------------------------------- Idempotency-Key 幂等分析
+
+def test_analysis_without_idempotency_key_creates_each_time(client):
+    # 不携带请求头：保持原有行为，每次请求都新增一份分析记录
+    client.post("/sites", json=make_payload())
+    first = client.post("/sites/1/analysis")
+    second = client.post("/sites/1/analysis")
+    assert first.status_code == 201 and second.status_code == 201
+    assert first.json()["analysis_id"] != second.json()["analysis_id"]
+    ids = [m["analysis_id"] for m in client.get("/sites/1/analyses").json()]
+    assert ids == [first.json()["analysis_id"], second.json()["analysis_id"]]
+
+
+def test_analysis_idempotency_key_replays_first_result(client):
+    # 同站点同键：首次执行并保存，之后直接回放首次结果，不新增分析记录
+    client.post("/sites", json=make_payload())
+    first = client.post("/sites/1/analysis", headers={"Idempotency-Key": "abc-123"})
+    assert first.status_code == 201, first.text
+    first_body = first.json()
+
+    for _ in range(3):
+        replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "abc-123"})
+        assert replay.status_code == 201
+        assert replay.json() == first_body  # 响应与首次完全一致
+
+    ids = [m["analysis_id"] for m in client.get("/sites/1/analyses").json()]
+    assert ids == [first_body["analysis_id"]]  # 重复键不新增记录
+    # GET 查询接口返回同一条结果，保持兼容
+    assert client.get("/sites/1/analysis").json() == first_body
+    assert client.get(f"/analyses/{first_body['analysis_id']}").json() == first_body
+
+
+def test_analysis_different_idempotency_keys_are_independent(client):
+    # 同站点不同键分别执行保存；之后各自回放自己的首次结果
+    client.post("/sites", json=make_payload())
+    k1 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-1"}).json()
+    k2 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-2"}).json()
+    assert k1["analysis_id"] != k2["analysis_id"]
+    assert client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-1"}).json() == k1
+    assert client.post("/sites/1/analysis", headers={"Idempotency-Key": "key-2"}).json() == k2
+    ids = [m["analysis_id"] for m in client.get("/sites/1/analyses").json()]
+    assert ids == sorted(ids) and len(ids) == 2
+
+
+def test_analysis_idempotency_key_scoped_per_site(client):
+    # 幂等键按站点隔离：不同站点使用相同字符串键互不影响，各自执行一次
+    client.post("/sites", json=make_payload(carriers_hz=[100, 300, 400]))
+    client.post("/sites", json=make_payload(name="site-b", carriers_hz=[1000, 1200]))
+    a1 = client.post("/sites/1/analysis", headers={"Idempotency-Key": "shared"})
+    a2 = client.post("/sites/2/analysis", headers={"Idempotency-Key": "shared"})
+    assert a1.json()["site_id"] == 1 and a2.json()["site_id"] == 2
+    assert a1.json()["analysis_id"] != a2.json()["analysis_id"]
+    # 各自重复都回放本站点的首次结果
+    assert client.post("/sites/1/analysis", headers={"Idempotency-Key": "shared"}).json() == a1.json()
+    assert client.post("/sites/2/analysis", headers={"Idempotency-Key": "shared"}).json() == a2.json()
+    assert len(client.get("/sites/1/analyses").json()) == 1
+    assert len(client.get("/sites/2/analyses").json()) == 1
+
+
+def test_analysis_blank_idempotency_key_rejected(client):
+    # 空白键（空串或仅空白字符）一律 422，且不写入任何分析记录
+    client.post("/sites", json=make_payload())
+    for blank in ("", " ", "\t", " \t \n"):
+        resp = client.post("/sites/1/analysis", headers={"Idempotency-Key": blank})
+        assert resp.status_code == 422, blank
+        assert "Idempotency-Key" in resp.json()["detail"]
+    assert client.get("/sites/1/analyses").json() == []
+    # 与 drift-risk 端点一致：先查站点（404），再校验键（422）
+    assert client.post(
+        "/sites/999/analysis", headers={"Idempotency-Key": " "}
+    ).status_code == 404
+    assert client.post(
+        "/sites/999/analysis", headers={"Idempotency-Key": "k"}
+    ).status_code == 404
+
+
+def test_analysis_idempotency_key_header_name_case_insensitive(client):
+    # HTTP 头名大小写不敏感，idempotency-key 与 Idempotency-Key 视为同一键
+    client.post("/sites", json=make_payload())
+    first = client.post("/sites/1/analysis", headers={"Idempotency-Key": "K"}).json()
+    replay = client.post("/sites/1/analysis", headers={"idempotency-key": "K"}).json()
+    assert replay == first
+    assert len(client.get("/sites/1/analyses").json()) == 1
+
+
+def test_analysis_concurrent_same_key_single_result(client, monkeypatch):
+    # 并发同键：多个线程同时发起请求也只能产生一份分析结果。
+    # 在获胜事务内拖慢分析，确保其他线程在 SQLite 写锁上排队（真实锁竞争），
+    # 排队线程在获胜事务提交后读到登记行并回放，分析函数本身只被调用一次。
+    import threading
+    import time
+
+    from app import main as main_mod
+
+    client.post("/sites", json=make_payload())
+    real_analyze = main_mod.analyze
+    compute_threads: list[int] = []
+    compute_lock = threading.Lock()
+
+    def slow_analyze(*args, **kwargs):
+        with compute_lock:
+            compute_threads.append(threading.get_ident())
+        time.sleep(0.3)  # 持锁等待：迫使同键竞争请求在 BEGIN IMMEDIATE 上排队
+        return real_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod, "analyze", slow_analyze)
+
+    n = 10
+    barrier = threading.Barrier(n)
+    responses: list[tuple[int, dict]] = []
+    errors: list[BaseException] = []
+
+    def fire() -> None:
+        barrier.wait()
+        try:
+            resp = client.post("/sites/1/analysis", headers={"Idempotency-Key": "race-key"})
+            responses.append((resp.status_code, resp.json()))
+        except BaseException as exc:  # noqa: BLE001 - 记录线程内异常便于断言失败
+            errors.append(exc)
+
+    threads = [threading.Thread(target=fire) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert len(responses) == n
+    assert all(status_code == 201 for status_code, _ in responses)
+    first = responses[0][1]
+    assert all(body == first for _, body in responses)  # 全部回放同一份结果
+    analysis_ids = {body["analysis_id"] for _, body in responses}
+    assert analysis_ids == {first["analysis_id"]}
+    metas = client.get("/sites/1/analyses").json()
+    assert len(metas) == 1  # 只保存了一份分析记录
+    assert metas[0]["analysis_id"] == first["analysis_id"]
+    assert len(compute_threads) == 1  # 仅持锁获胜者执行了一次分析计算
+
+
+def test_init_db_upgrades_existing_database_with_idempotency_table(tmp_path, monkeypatch):
+    # 升级路径：旧版本数据库只有原表（无幂等键表），init_db() 幂等补建新表、
+    # 保留旧数据，之后幂等分析功能可直接在升级后的库上使用
+    import sqlite3
+
+    from app import database
+
+    db_file = tmp_path / "legacy.db"
+    monkeypatch.setenv("IMD_DB_PATH", str(db_file))
+    # SCHEMA 中幂等键表是最后一段：取它之前的部分即旧版本结构
+    legacy_schema = database.SCHEMA.split(
+        "CREATE TABLE IF NOT EXISTS analysis_idempotency_keys"
+    )[0]
+    con = sqlite3.connect(db_file)
+    con.executescript(legacy_schema)
+    con.execute(
+        "INSERT INTO sites (name, scan_start_hz, scan_end_hz, guard_interval_hz)"
+        " VALUES ('legacy-site', 1, 10000, 150)"
+    )
+    con.executemany(
+        "INSERT INTO carriers (site_id, freq_hz) VALUES (1, ?)",
+        [(100,), (300,), (400,)],
+    )
+    con.commit()
+    con.close()
+
+    database.init_db()  # 幂等升级：补建新表
+    database.init_db()  # 再次初始化不报错（幂等）
+
+    con = sqlite3.connect(db_file)
+    tables = {
+        r[0]
+        for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "analysis_idempotency_keys" in tables
+    assert {"sites", "carriers", "guard_bands", "analyses"} <= tables
+    assert con.execute("SELECT name FROM sites").fetchone()[0] == "legacy-site"
+    pk_cols = [
+        r[1]
+        for r in con.execute("PRAGMA table_info(analysis_idempotency_keys)").fetchall()
+        if r[5] > 0
+    ]
+    assert pk_cols == ["site_id", "idempotency_key"]  # 复合主键：按站点隔离
+    con.close()
+
+    # 升级后的库可直接提供幂等分析（lifespan 内再次 init_db 同样无害）
+    with TestClient(app) as c:
+        first = c.post("/sites/1/analysis", headers={"Idempotency-Key": "k"})
+        replay = c.post("/sites/1/analysis", headers={"Idempotency-Key": "k"})
+        assert first.status_code == 201
+        assert first.json()["analysis_id"] == replay.json()["analysis_id"]
+
+
+def test_analysis_idempotent_failure_rolls_back_and_key_can_retry(client, monkeypatch):
+    # 首次请求在登记事务内分析失败时整体回滚：不登记键、不新增分析记录；
+    # 恢复后用同一个键重试仍按首次请求执行并保存
+    from app import main as main_mod
+
+    client.post("/sites", json=make_payload())
+
+    real_analyze = main_mod.analyze
+    attempts = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("analysis failed")  # 仅首次失败
+        return real_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod, "analyze", flaky)
+    with pytest.raises(RuntimeError):
+        client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+
+    assert client.get("/sites/1/analyses").json() == []  # 失败未残留任何记录
+    ok = client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+    assert ok.status_code == 201
+    replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "retry-me"})
+    assert replay.json() == ok.json()
+    assert len(client.get("/sites/1/analyses").json()) == 1
+
+
 # ---------------------------------------------------------------- 风险分组
 
 def test_risk_groups_404(client):

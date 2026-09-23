@@ -9,7 +9,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .schemas import (
     AnalysisMeta,
@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS analyses (
     product_count INTEGER NOT NULL,
     result_json   TEXT    NOT NULL
 );
+
+-- 幂等键登记：(site_id, idempotency_key) 唯一。仅携带 Idempotency-Key
+-- 请求头的分析请求在此表登记，未携带时不写此表，保持原有行为。
+CREATE TABLE IF NOT EXISTS analysis_idempotency_keys (
+    site_id       INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    idempotency_key TEXT  NOT NULL,
+    analysis_id   INTEGER NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (site_id, idempotency_key)
+);
 """
 
 
@@ -61,7 +71,7 @@ def db_path() -> str:
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     """短连接上下文：正常结束提交，抛异常回滚。"""
-    con = sqlite3.connect(db_path())
+    con = sqlite3.connect(db_path(), timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     try:
@@ -156,6 +166,56 @@ def insert_analysis(site_id: int, products: list[ProductOut]) -> tuple[int, str]
             "SELECT created_at FROM analyses WHERE id = ?", (cur.lastrowid,)
         ).fetchone()["created_at"]
     return cur.lastrowid, created_at
+
+
+def insert_analysis_idempotent(
+    site_id: int,
+    idempotency_key: str,
+    compute_products: Callable[[], list[ProductOut]],
+) -> tuple[AnalysisResult, bool]:
+    """在**单个 SQLite 事务**内按 (site_id, idempotency_key) 原子登记分析请求。
+
+    返回 (result, created)：
+    - 键首次出现：在同一事务内执行 ``compute_products()``、写入 analyses
+      记录并登记幂等键，三步要么全部提交要么整体回滚，``created=True``；
+    - 键已存在（串行重复或并发竞争失败的请求）：不执行分析、不新增任何
+      记录，直接回放首次结果，``created=False``。
+
+    事务以 ``BEGIN IMMEDIATE`` 立即获取写锁：携带同一键的并发请求在写锁上
+    排队，持锁事务提交后，后续事务读到已提交的登记行并回放，因此同一
+    (site_id, key) 无论多少并发请求都只产生一份分析结果。幂等键按站点
+    隔离：不同站点使用相同字符串键互不影响。
+    """
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT analysis_id FROM analysis_idempotency_keys"
+            " WHERE site_id = ? AND idempotency_key = ?",
+            (site_id, idempotency_key),
+        ).fetchone()
+        if row is not None:
+            saved = con.execute(
+                "SELECT * FROM analyses WHERE id = ?", (row["analysis_id"],)
+            ).fetchone()
+            assert saved is not None  # 外键约束 + 同事务写入保证引用有效
+            return _row_to_result(saved), False
+
+        products = compute_products()
+        result_json = json.dumps([p.model_dump() for p in products])
+        cur = con.execute(
+            "INSERT INTO analyses (site_id, product_count, result_json) VALUES (?, ?, ?)",
+            (site_id, len(products), result_json),
+        )
+        analysis_id = cur.lastrowid
+        con.execute(
+            "INSERT INTO analysis_idempotency_keys (site_id, idempotency_key, analysis_id)"
+            " VALUES (?, ?, ?)",
+            (site_id, idempotency_key, analysis_id),
+        )
+        saved = con.execute(
+            "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+        ).fetchone()
+        return _row_to_result(saved), True
 
 
 def _row_to_result(row: sqlite3.Row) -> AnalysisResult:
